@@ -1,3 +1,8 @@
+#ifndef _WIN32
+#define _FILE_OFFSET_BITS 64
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "aivdb_kernel.h"
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +13,7 @@
 #include <windows.h>
 #include <io.h>
 #else
+#include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -28,6 +34,12 @@
 #define AIVDB_TOKEN_MAX 2048
 #define AIVDB_HASH_SIZE 8192
 #define AIVDB_MAX_CHUNKS 1048576
+
+#if defined(__GNUC__) || defined(__clang__)
+#define AIVDB_MAYBE_UNUSED __attribute__((unused))
+#else
+#define AIVDB_MAYBE_UNUSED
+#endif
 
 typedef struct {
     uint32_t token_hash;
@@ -51,15 +63,18 @@ struct aivdb_t {
     float *vectors;
     aivdb_chunk_t *chunks;
     char *text_blob;
+    char *metadata_blob;
     aivdb_inverted_t inverted;
     char *doc_paths[4096];
     char *doc_titles[4096];
     uint32_t chunk_cap;
     uint64_t text_cap;
+    uint64_t metadata_cap;
     int writable;
     int own_vectors;
     int own_chunks;
     int own_text;
+    int own_metadata;
 };
 
 static char *aivdb_strdup(const char *s) {
@@ -68,6 +83,50 @@ static char *aivdb_strdup(const char *s) {
     char *out = (char *)malloc(n);
     if (out) memcpy(out, s, n);
     return out;
+}
+
+static int aivdb_fseek64(FILE *f, uint64_t offset) {
+#ifdef _WIN32
+    return _fseeki64(f, (__int64)offset, SEEK_SET);
+#else
+    return fseeko(f, (off_t)offset, SEEK_SET);
+#endif
+}
+
+static int aivdb_sync_file(FILE *f) {
+    if (!f) return -1;
+    if (fflush(f) != 0) return -1;
+#ifdef _WIN32
+    return _commit(_fileno(f));
+#else
+    return fsync(fileno(f));
+#endif
+}
+
+static char *aivdb_make_tmp_path(const char *path, const void *salt) {
+    if (!path) return NULL;
+    size_t n = strlen(path) + 80;
+    char *tmp = (char *)malloc(n);
+    if (!tmp) return NULL;
+#ifdef _WIN32
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    int written = snprintf(tmp, n, "%s.tmp.%lu.%p", path, pid, salt);
+    if (written < 0 || (size_t)written >= n) {
+        free(tmp);
+        return NULL;
+    }
+    return tmp;
+}
+
+static int aivdb_replace_file(const char *tmp_path, const char *path) {
+#ifdef _WIN32
+    return MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(tmp_path, path);
+#endif
 }
 
 static uint32_t fnv1a(const char *s, uint32_t len) {
@@ -305,7 +364,7 @@ static void inverted_add(aivdb_inverted_t *inv, uint32_t token_hash, uint32_t ch
     p->df++;
 }
 
-static float dot_f32_scalar(const float *a, const float *b, uint32_t dim) {
+static AIVDB_MAYBE_UNUSED float dot_f32_scalar(const float *a, const float *b, uint32_t dim) {
     float s = 0.0f;
     uint32_t i = 0;
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
@@ -321,16 +380,24 @@ static float dot_f32_scalar(const float *a, const float *b, uint32_t dim) {
 }
 
 #if !defined(AIVDB_FORCE_SCALAR) && defined(__AVX__)
-static float dot_f32_avx(const float *a, const float *b, uint32_t dim) {
-    __m256 sum = _mm256_setzero_ps();
+static AIVDB_MAYBE_UNUSED float dot_f32_avx(const float *a, const float *b, uint32_t dim) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
+    __m256 sum3 = _mm256_setzero_ps();
     uint32_t i = 0;
+    for (; i + 32 <= dim; i += 32) {
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8)));
+        sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16)));
+        sum3 = _mm256_add_ps(sum3, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24)));
+    }
+    sum0 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
     for (; i + 8 <= dim; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
     }
     float result[8];
-    _mm256_storeu_ps(result, sum);
+    _mm256_storeu_ps(result, sum0);
     float s = result[0] + result[1] + result[2] + result[3] + result[4] + result[5] + result[6] + result[7];
     for (; i < dim; i++) s += a[i] * b[i];
     return s;
@@ -338,16 +405,24 @@ static float dot_f32_avx(const float *a, const float *b, uint32_t dim) {
 #endif
 
 #if !defined(AIVDB_FORCE_SCALAR) && defined(__SSE__)
-static float dot_f32_sse(const float *a, const float *b, uint32_t dim) {
-    __m128 sum = _mm_setzero_ps();
+static AIVDB_MAYBE_UNUSED float dot_f32_sse(const float *a, const float *b, uint32_t dim) {
+    __m128 sum0 = _mm_setzero_ps();
+    __m128 sum1 = _mm_setzero_ps();
+    __m128 sum2 = _mm_setzero_ps();
+    __m128 sum3 = _mm_setzero_ps();
     uint32_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
+        sum1 = _mm_add_ps(sum1, _mm_mul_ps(_mm_loadu_ps(a + i + 4), _mm_loadu_ps(b + i + 4)));
+        sum2 = _mm_add_ps(sum2, _mm_mul_ps(_mm_loadu_ps(a + i + 8), _mm_loadu_ps(b + i + 8)));
+        sum3 = _mm_add_ps(sum3, _mm_mul_ps(_mm_loadu_ps(a + i + 12), _mm_loadu_ps(b + i + 12)));
+    }
+    sum0 = _mm_add_ps(_mm_add_ps(sum0, sum1), _mm_add_ps(sum2, sum3));
     for (; i + 4 <= dim; i += 4) {
-        __m128 va = _mm_loadu_ps(a + i);
-        __m128 vb = _mm_loadu_ps(b + i);
-        sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
+        sum0 = _mm_add_ps(sum0, _mm_mul_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
     }
     float result[4];
-    _mm_storeu_ps(result, sum);
+    _mm_storeu_ps(result, sum0);
     float s = result[0] + result[1] + result[2] + result[3];
     for (; i < dim; i++) s += a[i] * b[i];
     return s;
@@ -355,18 +430,26 @@ static float dot_f32_sse(const float *a, const float *b, uint32_t dim) {
 #endif
 
 #if !defined(AIVDB_FORCE_SCALAR) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
-static float dot_f32_neon(const float *a, const float *b, uint32_t dim) {
-    float32x4_t sum = vdupq_n_f32(0.0f);
+static AIVDB_MAYBE_UNUSED float dot_f32_neon(const float *a, const float *b, uint32_t dim) {
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
     uint32_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        sum0 = vmlaq_f32(sum0, vld1q_f32(a + i), vld1q_f32(b + i));
+        sum1 = vmlaq_f32(sum1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+        sum2 = vmlaq_f32(sum2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
+        sum3 = vmlaq_f32(sum3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    sum0 = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
     for (; i + 4 <= dim; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        sum = vmlaq_f32(sum, va, vb);
+        sum0 = vmlaq_f32(sum0, vld1q_f32(a + i), vld1q_f32(b + i));
     }
 #if defined(__aarch64__)
-    float s = vaddvq_f32(sum);
+    float s = vaddvq_f32(sum0);
 #else
-    float32x2_t pair = vadd_f32(vget_low_f32(sum), vget_high_f32(sum));
+    float32x2_t pair = vadd_f32(vget_low_f32(sum0), vget_high_f32(sum0));
     pair = vpadd_f32(pair, pair);
     float s = vget_lane_f32(pair, 0);
 #endif
@@ -486,6 +569,16 @@ static int reserve_text(aivdb_t *db, uint64_t needed) {
     return 0;
 }
 
+static int reserve_metadata(aivdb_t *db, uint64_t needed) {
+    if (db->metadata_cap >= needed) return 0;
+    char *new_blob = (char *)realloc(db->metadata_blob, (size_t)needed);
+    if (!new_blob) return -1;
+    db->metadata_blob = new_blob;
+    db->metadata_cap = needed;
+    db->own_metadata = 1;
+    return 0;
+}
+
 int aivdb_create(const char *path, uint32_t dim) {
     if (dim == 0 || dim > AIVDB_DIM_MAX) return -1;
     FILE *f = fopen(path, "wb");
@@ -506,11 +599,31 @@ int aivdb_create(const char *path, uint32_t dim) {
     hdr.chunk_table_size = 0;
     hdr.inverted_offset = 0;
     hdr.inverted_size = 0;
+    hdr.metadata_offset = 0;
+    hdr.metadata_size = 0;
     hdr.symbol_offset = 0;
     hdr.symbol_size = 0;
     fwrite(&hdr, sizeof(hdr), 1, f);
     fclose(f);
     return 0;
+}
+
+static void rebuild_inverted_from_chunks(aivdb_t *db) {
+    if (!db || !db->chunks || !db->text_blob) return;
+    inverted_free(&db->inverted);
+    inverted_init(&db->inverted);
+    for (uint32_t i = 0; i < db->header.chunk_count; i++) {
+        aivdb_chunk_t *chunk = &db->chunks[i];
+        if (chunk->text_offset >= db->header.text_blob_size) continue;
+        const char *text = db->text_blob + chunk->text_offset;
+        uint32_t text_len = chunk->text_len;
+        uint32_t tokens[AIVDB_TOKEN_MAX];
+        uint32_t ntokens;
+        tokenize_text(text, text_len, tokens, &ntokens);
+        ntokens = dedupe_tokens(tokens, ntokens);
+        float tf_norm = (chunk->token_count > 0) ? 1.0f / (1.0f + sqrtf((float)chunk->token_count)) : 1.0f;
+        for (uint32_t t = 0; t < ntokens; t++) inverted_add(&db->inverted, tokens[t], i, tf_norm);
+    }
 }
 
 int aivdb_open(const char *path, aivdb_t **db) {
@@ -526,36 +639,146 @@ int aivdb_open(const char *path, aivdb_t **db) {
     d->vectors = NULL;
     d->chunks = NULL;
     d->text_blob = NULL;
+    d->metadata_blob = NULL;
     d->own_vectors = 0;
     d->own_chunks = 0;
     d->own_text = 0;
+    d->own_metadata = 0;
     d->chunk_cap = 0;
     d->text_cap = 0;
+    d->metadata_cap = 0;
     d->writable = 0;
     inverted_init(&d->inverted);
 
     if (hdr.chunk_count > 0) {
         uint32_t dim = hdr.dim;
         uint32_t n = hdr.chunk_count;
-        d->vectors = (float *)malloc((size_t)n * dim * sizeof(float));
-        d->own_vectors = 1;
-        memset(d->vectors, 0, (size_t)n * dim * sizeof(float));
+        if (hdr.chunk_table_offset > 0 && hdr.chunk_table_size >= (uint64_t)n * sizeof(aivdb_chunk_t)) {
+            d->chunks = (aivdb_chunk_t *)malloc((size_t)n * sizeof(aivdb_chunk_t));
+            if (!d->chunks) { aivdb_close(d); return -1; }
+            f = fopen(path, "rb");
+            if (!f) { aivdb_close(d); return -1; }
+            if (aivdb_fseek64(f, hdr.chunk_table_offset) != 0 ||
+                fread(d->chunks, sizeof(aivdb_chunk_t), n, f) != n) {
+                fclose(f); aivdb_close(d); return -1;
+            }
+            fclose(f);
+            d->own_chunks = 1;
+            d->chunk_cap = n;
+        }
 
-        d->chunks = (aivdb_chunk_t *)malloc(n * sizeof(aivdb_chunk_t));
-        d->own_chunks = 1;
-        d->chunk_cap = n;
-        memset(d->chunks, 0, n * sizeof(aivdb_chunk_t));
+        if (hdr.vector_block_offset > 0 && hdr.vector_block_size >= (uint64_t)n * dim * sizeof(float)) {
+            d->vectors = (float *)malloc((size_t)n * dim * sizeof(float));
+            if (!d->vectors) { aivdb_close(d); return -1; }
+            f = fopen(path, "rb");
+            if (!f) { aivdb_close(d); return -1; }
+            if (aivdb_fseek64(f, hdr.vector_block_offset) != 0 ||
+                fread(d->vectors, dim * sizeof(float), n, f) != n) {
+                fclose(f); aivdb_close(d); return -1;
+            }
+            fclose(f);
+            d->own_vectors = 1;
+        }
 
-        if (hdr.text_blob_size > 0) {
+        if (hdr.text_blob_offset > 0 && hdr.text_blob_size > 0) {
             d->text_blob = (char *)malloc((size_t)hdr.text_blob_size + 1);
+            if (!d->text_blob) { aivdb_close(d); return -1; }
+            f = fopen(path, "rb");
+            if (!f) { aivdb_close(d); return -1; }
+            if (aivdb_fseek64(f, hdr.text_blob_offset) != 0 ||
+                fread(d->text_blob, 1, (size_t)hdr.text_blob_size, f) != (size_t)hdr.text_blob_size) {
+                fclose(f); aivdb_close(d); return -1;
+            }
+            fclose(f);
             d->own_text = 1;
             d->text_cap = hdr.text_blob_size + 1;
             d->text_blob[hdr.text_blob_size] = 0;
         }
+        rebuild_inverted_from_chunks(d);
+    }
+
+    if (hdr.metadata_offset > 0 && hdr.metadata_size > 0) {
+        d->metadata_blob = (char *)malloc((size_t)hdr.metadata_size + 1);
+        if (!d->metadata_blob) { aivdb_close(d); return -1; }
+        f = fopen(path, "rb");
+        if (!f) { aivdb_close(d); return -1; }
+        if (aivdb_fseek64(f, hdr.metadata_offset) != 0 ||
+            fread(d->metadata_blob, 1, (size_t)hdr.metadata_size, f) != (size_t)hdr.metadata_size) {
+            fclose(f); aivdb_close(d); return -1;
+        }
+        fclose(f);
+        d->own_metadata = 1;
+        d->metadata_cap = hdr.metadata_size + 1;
+        d->metadata_blob[hdr.metadata_size] = 0;
     }
 
     *db = d;
     return 0;
+}
+
+int aivdb_flush(aivdb_t *db, const char *path) {
+    if (!db || !path) return -1;
+    char *tmp_path = aivdb_make_tmp_path(path, db);
+    if (!tmp_path) return -1;
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        free(tmp_path);
+        return -1;
+    }
+    int rc = -1;
+
+    aivdb_header_t hdr = db->header;
+    uint64_t off = sizeof(aivdb_header_t);
+    hdr.chunk_table_offset = off;
+    hdr.chunk_table_size = (uint64_t)hdr.chunk_count * sizeof(aivdb_chunk_t);
+    off += hdr.chunk_table_size;
+    hdr.vector_block_offset = off;
+    hdr.vector_block_size = (uint64_t)hdr.chunk_count * hdr.dim * sizeof(float);
+    off += hdr.vector_block_size;
+    hdr.text_blob_offset = off;
+    hdr.text_blob_size = db->header.text_blob_size;
+    off += hdr.text_blob_size;
+    hdr.inverted_offset = 0;
+    hdr.inverted_size = 0;
+    if (db->header.metadata_size > 0 && db->metadata_blob) {
+        hdr.metadata_offset = off;
+        hdr.metadata_size = db->header.metadata_size;
+        off += hdr.metadata_size;
+    } else {
+        hdr.metadata_offset = 0;
+        hdr.metadata_size = 0;
+    }
+    hdr.symbol_offset = 0;
+    hdr.symbol_size = 0;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) goto done;
+    if (hdr.chunk_table_size && fwrite(db->chunks, sizeof(aivdb_chunk_t), hdr.chunk_count, f) != hdr.chunk_count) {
+        goto done;
+    }
+    if (hdr.vector_block_size && fwrite(db->vectors, hdr.dim * sizeof(float), hdr.chunk_count, f) != hdr.chunk_count) {
+        goto done;
+    }
+    if (hdr.text_blob_size && fwrite(db->text_blob, 1, (size_t)hdr.text_blob_size, f) != (size_t)hdr.text_blob_size) {
+        goto done;
+    }
+    if (hdr.metadata_size && fwrite(db->metadata_blob, 1, (size_t)hdr.metadata_size, f) != (size_t)hdr.metadata_size) {
+        goto done;
+    }
+    if (aivdb_sync_file(f) != 0) goto done;
+    if (fclose(f) != 0) {
+        f = NULL;
+        goto done;
+    }
+    f = NULL;
+    if (aivdb_replace_file(tmp_path, path) != 0) goto done;
+    db->header = hdr;
+    rc = 0;
+
+done:
+    if (f) fclose(f);
+    if (rc != 0) remove(tmp_path);
+    free(tmp_path);
+    return rc;
 }
 
 int aivdb_close(aivdb_t *db) {
@@ -563,6 +786,7 @@ int aivdb_close(aivdb_t *db) {
     if (db->own_vectors) free(db->vectors);
     if (db->own_chunks) free(db->chunks);
     if (db->own_text) free(db->text_blob);
+    if (db->own_metadata) free(db->metadata_blob);
     inverted_free(&db->inverted);
     for (uint32_t i = 0; i < db->header.doc_count; i++) {
         free(db->doc_paths[i]);
@@ -781,6 +1005,33 @@ const char *aivdb_chunk_text(const aivdb_t *db, uint32_t chunk_id) {
     return db->text_blob + db->chunks[chunk_id].text_offset;
 }
 
+int aivdb_set_metadata(aivdb_t *db, const char *metadata, uint64_t metadata_size) {
+    if (!db) return -1;
+    if (!metadata || metadata_size == 0) {
+        if (db->own_metadata) free(db->metadata_blob);
+        db->metadata_blob = NULL;
+        db->metadata_cap = 0;
+        db->own_metadata = 0;
+        db->header.metadata_size = 0;
+        db->header.metadata_offset = 0;
+        return 0;
+    }
+    if (reserve_metadata(db, metadata_size + 1) != 0) return -1;
+    memcpy(db->metadata_blob, metadata, (size_t)metadata_size);
+    db->metadata_blob[metadata_size] = 0;
+    db->header.metadata_size = metadata_size;
+    return 0;
+}
+
+const char *aivdb_metadata(const aivdb_t *db) {
+    if (!db || !db->metadata_blob || db->header.metadata_size == 0) return NULL;
+    return db->metadata_blob;
+}
+
+uint64_t aivdb_metadata_size(const aivdb_t *db) {
+    return db ? db->header.metadata_size : 0;
+}
+
 int aivdb_load_synthetic(aivdb_t *db, uint32_t nchunks, const float *vectors_block, uint32_t seed) {
     if (!db) return -1;
     if (nchunks > AIVDB_MAX_CHUNKS) return -1;
@@ -789,6 +1040,7 @@ int aivdb_load_synthetic(aivdb_t *db, uint32_t nchunks, const float *vectors_blo
     if (db->own_vectors) free(db->vectors);
     if (db->own_chunks) free(db->chunks);
     if (db->own_text) free(db->text_blob);
+    if (db->own_metadata) free(db->metadata_blob);
     for (uint32_t i = 0; i < db->header.doc_count && i < 4096; i++) {
         free(db->doc_paths[i]);
         free(db->doc_titles[i]);
@@ -799,11 +1051,16 @@ int aivdb_load_synthetic(aivdb_t *db, uint32_t nchunks, const float *vectors_blo
     db->vectors = NULL;
     db->chunks = NULL;
     db->text_blob = NULL;
+    db->metadata_blob = NULL;
     db->chunk_cap = 0;
     db->text_cap = 0;
+    db->metadata_cap = 0;
     db->own_vectors = 0;
     db->own_chunks = 0;
     db->own_text = 0;
+    db->own_metadata = 0;
+    db->header.metadata_offset = 0;
+    db->header.metadata_size = 0;
 
     db->header.chunk_count = nchunks;
     db->header.doc_count = 1;

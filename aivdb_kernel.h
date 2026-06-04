@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define AIVDB_MAGIC "AIVDB001"
-#define AIVDB_VERSION 1
+#define AIVDB_VERSION 2
 #define AIVDB_DIM_MAX 4096
 #define AIVDB_DIM_DEFAULT 768
 
@@ -28,9 +28,11 @@ typedef struct {
     uint64_t chunk_table_size;
     uint64_t inverted_offset;
     uint64_t inverted_size;
+    uint64_t metadata_offset;
+    uint64_t metadata_size;
     uint64_t symbol_offset;
     uint64_t symbol_size;
-    uint64_t reserved[8];
+    uint64_t reserved[6];
 } aivdb_header_t;
 
 typedef struct {
@@ -64,6 +66,9 @@ int  aivdb_search_hybrid(const aivdb_t *db, const char *query, const float *embe
 uint32_t aivdb_chunk_count(const aivdb_t *db);
 uint32_t aivdb_dim(const aivdb_t *db);
 const char *aivdb_chunk_text(const aivdb_t *db, uint32_t chunk_id);
+int  aivdb_set_metadata(aivdb_t *db, const char *metadata, uint64_t metadata_size);
+const char *aivdb_metadata(const aivdb_t *db);
+uint64_t aivdb_metadata_size(const aivdb_t *db);
 int  aivdb_add_document(aivdb_t *db, const char *path, const char *title, uint32_t *out_doc_id);
 int  aivdb_load_synthetic(aivdb_t *db, uint32_t nchunks, const float *vectors_block, uint32_t seed);
 
